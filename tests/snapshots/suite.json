@@ -1,0 +1,40 @@
+{
+  "profile": "software.cfg",
+  "variants": [
+    {
+      "name": "software"
+    },
+    {
+      "name": "frontend-internal2",
+      "options": {
+        "swanstation_Main_RunaheadFrameCount": "2"
+      },
+      "equal_to": "software"
+    },
+    {
+      "name": "ordinary-internal0",
+      "options": {
+        "@frontend": "ordinary"
+      }
+    },
+    {
+      "name": "ordinary-internal2",
+      "options": {
+        "@frontend": "ordinary",
+        "swanstation_Main_RunaheadFrameCount": "2"
+      },
+      "counter_delta": [
+        "ordinary-internal0",
+        2
+      ]
+    },
+    {
+      "name": "declined-internal2",
+      "options": {
+        "@frontend": "decline",
+        "swanstation_Main_RunaheadFrameCount": "2"
+      },
+      "equal_to": "ordinary-internal2"
+    }
+  ]
+}

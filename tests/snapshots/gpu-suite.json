@@ -1,0 +1,41 @@
+{
+  "profile": "software.cfg",
+  "variants": [
+    {
+      "name": "opengl-4x",
+      "driver": "glcore",
+      "options": {
+        "swanstation_GPU_Renderer": "OpenGL",
+        "swanstation_GPU_ResolutionScale": "4"
+      }
+    },
+    {
+      "name": "vulkan-4x",
+      "driver": "vulkan",
+      "options": {
+        "swanstation_GPU_Renderer": "Vulkan",
+        "swanstation_GPU_ResolutionScale": "4"
+      }
+    },
+    {
+      "name": "opengl-4x-pgxp-cache",
+      "driver": "glcore",
+      "options": {
+        "swanstation_GPU_Renderer": "OpenGL",
+        "swanstation_GPU_ResolutionScale": "4",
+        "swanstation_GPU_PGXPEnable": "true",
+        "swanstation_GPU_PGXPVertexCache": "true"
+      }
+    },
+    {
+      "name": "vulkan-4x-pgxp-cache",
+      "driver": "vulkan",
+      "options": {
+        "swanstation_GPU_Renderer": "Vulkan",
+        "swanstation_GPU_ResolutionScale": "4",
+        "swanstation_GPU_PGXPEnable": "true",
+        "swanstation_GPU_PGXPVertexCache": "true"
+      }
+    }
+  ]
+}

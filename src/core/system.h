@@ -152,6 +152,18 @@ void SetCheatList(std::unique_ptr<CheatList> cheats);
 // Memory Save States (Runahead)
 //////////////////////////////////////////////////////////////////////////
 void ClearMemorySaveStates();
+bool RuntimeSnapshotSupported(uint32_t count);
+void* CreateRuntimeSnapshot();
+void ReleaseRuntimeSnapshot(void* snapshot);
+bool RuntimeSnapshotValid(const void* snapshot);
+bool SaveRuntimeSnapshot(void* snapshot);
+bool LoadRuntimeSnapshot(const void* snapshot);
+enum class RuntimeExecutionContext { Ordinary, Canonical, Speculative };
+void SetSnapshotExecutionContext(RuntimeExecutionContext (*context)());
+bool RuntimeSnapshotBlocked();
+void BeginRuntimeSnapshotOrdinaryLoad();
+void EndRuntimeSnapshotOrdinaryLoad(bool success, bool interrupted = false);
+bool IsTemporaryState();
 void UpdateMemorySaveStateSettings();
 void SetRunaheadReplayFlag();
 

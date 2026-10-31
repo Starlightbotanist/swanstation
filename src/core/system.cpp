@@ -40,6 +40,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <new>
 #include <limits>
 
 #include <compat/strl.h>
@@ -60,8 +61,61 @@ namespace System {
 struct MemorySaveState
 {
   std::unique_ptr<HostDisplayTexture> vram_texture;
+  std::shared_ptr<const PGXP::MemorySnapshot> pgxp;
   std::unique_ptr<GrowableMemoryByteStream> state_stream;
 };
+
+struct RuntimeSnapshot
+{
+  RuntimeSnapshot* next = nullptr;
+  MemorySaveState image;
+  bool captured = false;
+};
+
+static RuntimeSnapshot* s_snapshots;
+static MemorySaveState s_snapshot_staging;
+static RuntimeExecutionContext (*s_snapshot_context)();
+static bool s_snapshot_blocked;
+static bool s_snapshot_ordinary_load;
+static bool s_snapshot_loading;
+
+void SetSnapshotExecutionContext(RuntimeExecutionContext (*context)())
+{
+  s_snapshot_context = context;
+}
+
+static bool FrontendOwnsPrediction()
+{
+  return s_snapshot_context && s_snapshot_context() != RuntimeExecutionContext::Ordinary;
+}
+
+bool RuntimeSnapshotBlocked()
+{
+  return s_snapshot_blocked;
+}
+
+bool IsTemporaryState()
+{
+  return s_snapshot_loading || s_snapshot_blocked || s_snapshot_ordinary_load ||
+         (s_snapshot_context && s_snapshot_context() == RuntimeExecutionContext::Speculative);
+}
+
+void BeginRuntimeSnapshotOrdinaryLoad()
+{
+  s_snapshot_ordinary_load = true;
+}
+
+void EndRuntimeSnapshotOrdinaryLoad(bool success, bool interrupted)
+{
+  s_snapshot_ordinary_load = false;
+  if (success)
+  {
+    ClearMemorySaveStates();
+    s_snapshot_blocked = false;
+  }
+  else if (interrupted)
+    s_snapshot_blocked = true;
+}
 
 static bool SaveMemoryState(MemorySaveState* mss);
 static bool LoadMemoryState(const MemorySaveState& mss);
@@ -794,6 +848,7 @@ void Shutdown()
   // tearing the system down first.
   CheatList::ResetSharedScratchRegisters();
   s_state = State::Shutdown;
+  s_snapshot_blocked = false;
 
   g_host_interface->OnRunningGameChanged(s_running_game_path, nullptr, s_running_game_code, s_running_game_title);
 }
@@ -932,6 +987,7 @@ void Reset()
     return;
 
   g_gpu->RestoreGraphicsAPIState();
+  ClearMemorySaveStates();
 
   CPU::Reset();
   CPU::CodeCache::Flush();
@@ -952,6 +1008,7 @@ void Reset()
   TimingEvents::Reset();
 
   g_gpu->ResetGraphicsAPIState();
+  s_snapshot_blocked = false;
 }
 
 bool LoadState(ByteStream* state, bool is_memory_state, bool restore_on_failure, const char* media_path,
@@ -1079,7 +1136,10 @@ bool DoLoadState(ByteStream* state, bool force_software_renderer, bool update_di
     }
   }
 
-  ClearMemorySaveStates();
+  if (s_snapshot_ordinary_load)
+    s_runahead_states.clear();
+  else
+    ClearMemorySaveStates();
 
   if (s_state == State::Starting)
   {
@@ -1224,6 +1284,13 @@ void DoRunFrame()
 
 void RunFrame()
 {
+  const uint32_t frames = FrontendOwnsPrediction() ? 0 : g_settings.runahead_frames;
+  if (frames != s_runahead_frames)
+  {
+    s_runahead_states.clear();
+    s_runahead_replay_pending = false;
+    s_runahead_frames = frames;
+  }
   if (s_runahead_frames > 0)
     DoRunahead();
 
@@ -1788,13 +1855,21 @@ void SetCheatList(std::unique_ptr<CheatList> cheats)
 void ClearMemorySaveStates()
 {
   s_runahead_states.clear();
+  s_runahead_replay_pending = false;
+  PGXP::TrimMemorySnapshots();
+  s_snapshot_staging = {};
+  for (RuntimeSnapshot* state = s_snapshots; state; state = state->next)
+  {
+    state->captured = false;
+    state->image = {};
+  }
 }
 
 void UpdateMemorySaveStateSettings()
 {
   ClearMemorySaveStates();
 
-  s_runahead_frames = g_settings.runahead_frames;
+  s_runahead_frames = FrontendOwnsPrediction() ? 0 : g_settings.runahead_frames;
   s_runahead_replay_pending = false;
   if (s_runahead_frames > 0)
   {
@@ -1809,6 +1884,8 @@ void UpdateMemorySaveStateSettings()
 
 bool LoadMemoryState(const MemorySaveState& mss)
 {
+  if (!PGXP::MemorySnapshotMatches(mss.pgxp))
+    return false;
   mss.state_stream->SeekAbsolute(0);
 
   StateWrapper sw(mss.state_stream.get(), StateWrapper::Mode::Read, SAVE_STATE_VERSION);
@@ -1820,27 +1897,127 @@ bool LoadMemoryState(const MemorySaveState& mss)
     return false;
   }
 
+  PGXP::LoadMemorySnapshot(mss.pgxp);
   return true;
 }
 
 bool SaveMemoryState(MemorySaveState* mss)
 {
+  std::shared_ptr<const PGXP::MemorySnapshot> pgxp;
+  if (!PGXP::SaveMemorySnapshot(&pgxp))
+    return false;
   if (!mss->state_stream)
     mss->state_stream = std::make_unique<GrowableMemoryByteStream>(nullptr, MAX_SAVE_STATE_SIZE);
   else
     mss->state_stream->SeekAbsolute(0);
 
   HostDisplayTexture* host_texture = mss->vram_texture.release();
-  StateWrapper sw(mss->state_stream.get(), StateWrapper::Mode::Write, SAVE_STATE_VERSION);
-  if (!DoState(sw, &host_texture, false, true))
+  bool okay;
+  try
   {
-    Log_ErrorPrint("Failed to create runahead memory state.");
-    delete host_texture;
+    StateWrapper sw(mss->state_stream.get(), StateWrapper::Mode::Write, SAVE_STATE_VERSION);
+    okay = DoState(sw, &host_texture, false, true);
+  }
+  catch (const std::bad_alloc&)
+  {
+    mss->vram_texture.reset(host_texture);
+    throw;
+  }
+  mss->vram_texture.reset(host_texture);
+  if (okay)
+    mss->pgxp = std::move(pgxp);
+  return okay;
+}
+
+bool RuntimeSnapshotSupported(uint32_t count)
+{
+  return count != 0 && IsValid() && !s_snapshot_blocked;
+}
+
+static bool OwnsRuntimeSnapshot(const RuntimeSnapshot* snapshot)
+{
+  for (const RuntimeSnapshot* state = s_snapshots; state; state = state->next)
+    if (state == snapshot)
+      return true;
+  return false;
+}
+
+void* CreateRuntimeSnapshot()
+{
+  auto* state = new (std::nothrow) RuntimeSnapshot;
+  if (state)
+  {
+    state->next = s_snapshots;
+    s_snapshots = state;
+  }
+  return state;
+}
+
+void ReleaseRuntimeSnapshot(void* snapshot)
+{
+  auto** link = &s_snapshots;
+  while (*link && *link != snapshot)
+    link = &(*link)->next;
+  if (!*link)
+    return;
+  auto* state = *link;
+  *link = state->next;
+  delete state;
+  if (!s_snapshots)
+    s_snapshot_staging = {};
+  if (!s_snapshots && s_runahead_states.empty())
+    PGXP::TrimMemorySnapshots();
+}
+
+bool RuntimeSnapshotValid(const void* snapshot)
+{
+  auto* state = static_cast<const RuntimeSnapshot*>(snapshot);
+  return OwnsRuntimeSnapshot(state) && state->captured && IsValid() &&
+         PGXP::MemorySnapshotMatches(state->image.pgxp);
+}
+
+bool SaveRuntimeSnapshot(void* snapshot)
+{
+  auto* state = static_cast<RuntimeSnapshot*>(snapshot);
+  if (!OwnsRuntimeSnapshot(state) || !IsValid() || s_snapshot_blocked)
+    return false;
+  try
+  {
+    if (!SaveMemoryState(&s_snapshot_staging))
+      return false;
+  }
+  catch (const std::bad_alloc&)
+  {
     return false;
   }
-
-  mss->vram_texture.reset(host_texture);
+  std::swap(state->image, s_snapshot_staging);
+  state->captured = true;
   return true;
+}
+
+bool LoadRuntimeSnapshot(const void* snapshot)
+{
+  auto* state = static_cast<const RuntimeSnapshot*>(snapshot);
+  if (!RuntimeSnapshotValid(state) || s_snapshot_loading)
+    return false;
+  if (!state->image.state_stream->SeekAbsolute(0))
+    return false;
+  StateWrapper reader(state->image.state_stream.get(), StateWrapper::Mode::Read, SAVE_STATE_VERSION);
+  HostDisplayTexture* texture = state->image.vram_texture.get();
+  s_snapshot_loading = true;
+  bool okay = false;
+  try
+  {
+    okay = DoState(reader, &texture, true, true);
+  }
+  catch (const std::bad_alloc&)
+  {
+  }
+  if (okay)
+    PGXP::LoadMemorySnapshot(state->image.pgxp);
+  s_snapshot_loading = false;
+  s_snapshot_blocked = !okay;
+  return okay;
 }
 
 void SaveRunaheadState()

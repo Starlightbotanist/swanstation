@@ -93,14 +93,60 @@ RETRO_API unsigned retro_api_version(void)
   return RETRO_API_VERSION;
 }
 
+static enum retro_snapshot_execution_context (RETRO_CALLCONV *s_snapshot_context)();
+
+static System::RuntimeExecutionContext SnapshotExecutionContext()
+{
+  return static_cast<System::RuntimeExecutionContext>(s_snapshot_context());
+}
+
+static enum retro_snapshot_result RETRO_CALLCONV SnapshotCreate(void** output)
+{
+  if (System::RuntimeSnapshotBlocked())
+    return RETRO_SNAPSHOT_FATAL;
+  if (!output || *output)
+    return RETRO_SNAPSHOT_UNAVAILABLE;
+  *output = System::CreateRuntimeSnapshot();
+  return *output ? RETRO_SNAPSHOT_SUCCESS : RETRO_SNAPSHOT_UNAVAILABLE;
+}
+
+static enum retro_snapshot_result RETRO_CALLCONV SnapshotSave(void* snapshot)
+{
+  if (System::RuntimeSnapshotBlocked())
+    return RETRO_SNAPSHOT_FATAL;
+  return System::SaveRuntimeSnapshot(snapshot) ? RETRO_SNAPSHOT_SUCCESS : RETRO_SNAPSHOT_UNAVAILABLE;
+}
+
+static enum retro_snapshot_result RETRO_CALLCONV SnapshotLoad(const void* snapshot)
+{
+  if (System::LoadRuntimeSnapshot(snapshot))
+    return RETRO_SNAPSHOT_SUCCESS;
+  return System::RuntimeSnapshotBlocked() ? RETRO_SNAPSHOT_FATAL : RETRO_SNAPSHOT_UNAVAILABLE;
+}
+
 RETRO_API void retro_init(void)
 {
   g_host_interface_storage.Initialize();
+  retro_snapshot_interface snapshots = {
+    RETRO_SNAPSHOT_INTERFACE_VERSION, sizeof(retro_snapshot_interface),
+    System::RuntimeSnapshotSupported, SnapshotCreate, SnapshotSave, SnapshotLoad,
+    System::ReleaseRuntimeSnapshot, System::RuntimeSnapshotValid, nullptr
+  };
+  s_snapshot_context = nullptr;
+  System::SetSnapshotExecutionContext(nullptr);
+  if (g_retro_environment_callback(RETRO_ENVIRONMENT_SET_SNAPSHOT_INTERFACE, &snapshots) &&
+      snapshots.get_execution_context)
+  {
+    s_snapshot_context = snapshots.get_execution_context;
+    System::SetSnapshotExecutionContext(SnapshotExecutionContext);
+  }
 }
 
 RETRO_API void retro_deinit(void)
 {
   g_host_interface_storage.Shutdown();
+  System::SetSnapshotExecutionContext(nullptr);
+  s_snapshot_context = nullptr;
 }
 
 RETRO_API void retro_get_system_info(struct retro_system_info* info)
@@ -142,22 +188,39 @@ RETRO_API void retro_reset(void)
 
 RETRO_API void retro_run(void)
 {
+  if (System::RuntimeSnapshotBlocked())
+    return;
   g_host_interface_storage.retro_run_frame();
 }
 
 RETRO_API size_t retro_serialize_size(void)
 {
+  if (System::RuntimeSnapshotBlocked())
+    return 0;
   return g_host_interface_storage.retro_serialize_size();
 }
 
 RETRO_API bool retro_serialize(void* data, size_t size)
 {
+  if (System::RuntimeSnapshotBlocked())
+    return false;
   return g_host_interface_storage.retro_serialize(data, size);
 }
 
 RETRO_API bool retro_unserialize(const void* data, size_t size)
 {
-  return g_host_interface_storage.retro_unserialize(data, size);
+  System::BeginRuntimeSnapshotOrdinaryLoad();
+  try
+  {
+    const bool okay = g_host_interface_storage.retro_unserialize(data, size);
+    System::EndRuntimeSnapshotOrdinaryLoad(okay);
+    return okay;
+  }
+  catch (const std::bad_alloc&)
+  {
+    System::EndRuntimeSnapshotOrdinaryLoad(false, true);
+    return false;
+  }
 }
 
 RETRO_API void retro_cheat_reset(void)
@@ -192,11 +255,15 @@ RETRO_API unsigned retro_get_region(void)
 
 RETRO_API void* retro_get_memory_data(unsigned id)
 {
+  if (System::RuntimeSnapshotBlocked())
+    return nullptr;
   return g_host_interface_storage.retro_get_memory_data(id);
 }
 
 RETRO_API size_t retro_get_memory_size(unsigned id)
 {
+  if (System::RuntimeSnapshotBlocked())
+    return 0;
   return g_host_interface_storage.retro_get_memory_size(id);
 }
 
@@ -945,7 +1012,7 @@ void HostInterface::retro_run_frame()
     }
   }
 
-  if (HasCoreVariablesChanged() || controller_dirty)
+  if (!System::IsTemporaryState() && (HasCoreVariablesChanged() || controller_dirty))
   {
     controller_dirty = false;
     UpdateSettings();

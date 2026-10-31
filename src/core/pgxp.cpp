@@ -23,6 +23,9 @@
 #include "cpu_core.h"
 #include "settings.h"
 #include <climits>
+#include <array>
+#include <vector>
+#include <new>
 #include <cmath>
 #include <cstring>
 namespace PGXP {
@@ -108,6 +111,122 @@ static PGXP_value GTE_ctrl_reg[32];
 static PGXP_value* Mem = nullptr;
 static PGXP_value* vertexCache = nullptr;
 
+static constexpr size_t SNAPSHOT_PAGE_VALUES = 1024;
+using SnapshotPage = std::array<PGXP_value, SNAPSHOT_PAGE_VALUES>;
+using SnapshotPages = std::vector<std::shared_ptr<const SnapshotPage>>;
+
+struct MemorySnapshot
+{
+  std::array<PGXP_value, 34> cpu;
+  std::array<PGXP_value, 32> cp0, gte_data, gte_control;
+  SnapshotPages memory, vertices;
+};
+
+static std::shared_ptr<const MemorySnapshot> current_snapshot;
+static std::array<bool, (PGXP_MEM_SIZE + SNAPSHOT_PAGE_VALUES - 1) / SNAPSHOT_PAGE_VALUES> memory_dirty;
+static std::array<bool, (VERTEX_CACHE_SIZE + SNAPSHOT_PAGE_VALUES - 1) / SNAPSHOT_PAGE_VALUES> vertices_dirty;
+
+void TrimMemorySnapshots()
+{
+  current_snapshot.reset();
+  memory_dirty.fill(true);
+  vertices_dirty.fill(true);
+}
+
+static SnapshotPages CapturePages(const PGXP_value* source, size_t count, const bool* dirty,
+                                 const SnapshotPages* previous)
+{
+  static const auto zero = std::make_shared<SnapshotPage>();
+  SnapshotPages pages((count + SNAPSHOT_PAGE_VALUES - 1) / SNAPSHOT_PAGE_VALUES);
+  for (size_t i = 0; i < pages.size(); i++)
+  {
+    const size_t values = std::min(SNAPSHOT_PAGE_VALUES, count - i * SNAPSHOT_PAGE_VALUES);
+    const PGXP_value* input = source + i * SNAPSHOT_PAGE_VALUES;
+    if (previous && i < previous->size() &&
+        (!dirty[i] || !std::memcmp(input, (*previous)[i]->data(), values * sizeof(PGXP_value))))
+      pages[i] = (*previous)[i];
+    else if (!std::memcmp(input, zero->data(), values * sizeof(PGXP_value)))
+      pages[i] = zero;
+    else
+    {
+      auto page = std::make_shared<SnapshotPage>();
+      std::memcpy(page->data(), input, values * sizeof(PGXP_value));
+      pages[i] = std::move(page);
+    }
+  }
+  return pages;
+}
+
+bool SaveMemorySnapshot(std::shared_ptr<const MemorySnapshot>* output)
+{
+  if (!g_settings.gpu_pgxp_enable)
+  {
+    output->reset();
+    return true;
+  }
+  if (!Mem)
+    return false;
+  try
+  {
+    auto state = std::make_shared<MemorySnapshot>();
+    std::memcpy(state->cpu.data(), CPU_reg, sizeof(CPU_reg));
+    std::memcpy(state->cp0.data(), CP0_reg, sizeof(CP0_reg));
+    std::memcpy(state->gte_data.data(), GTE_data_reg, sizeof(GTE_data_reg));
+    std::memcpy(state->gte_control.data(), GTE_ctrl_reg, sizeof(GTE_ctrl_reg));
+    state->memory = CapturePages(Mem, PGXP_MEM_SIZE, memory_dirty.data(),
+                                current_snapshot ? &current_snapshot->memory : nullptr);
+    if (vertexCache)
+      state->vertices = CapturePages(vertexCache, VERTEX_CACHE_SIZE, vertices_dirty.data(),
+                                    current_snapshot ? &current_snapshot->vertices : nullptr);
+    *output = state;
+    current_snapshot = std::move(state);
+    memory_dirty.fill(false);
+    vertices_dirty.fill(false);
+    return true;
+  }
+  catch (const std::bad_alloc&)
+  {
+    return false;
+  }
+}
+
+bool MemorySnapshotMatches(const std::shared_ptr<const MemorySnapshot>& state)
+{
+  if (!state)
+    return !g_settings.gpu_pgxp_enable;
+  return g_settings.gpu_pgxp_enable && Mem && !state->memory.empty() &&
+         state->vertices.empty() == (vertexCache == nullptr);
+}
+
+static void RestorePages(PGXP_value* target, size_t count, const SnapshotPages& pages,
+                         const SnapshotPages* previous, bool* dirty)
+{
+  for (size_t i = 0; i < pages.size(); i++)
+  {
+    if (dirty[i] || !previous || i >= previous->size() || pages[i] != (*previous)[i])
+      std::memcpy(target + i * SNAPSHOT_PAGE_VALUES, pages[i]->data(),
+                  std::min(SNAPSHOT_PAGE_VALUES, count - i * SNAPSHOT_PAGE_VALUES) * sizeof(PGXP_value));
+    dirty[i] = false;
+  }
+}
+
+void LoadMemorySnapshot(const std::shared_ptr<const MemorySnapshot>& state)
+{
+  if (!state)
+    return;
+  RestorePages(Mem, PGXP_MEM_SIZE, state->memory,
+               current_snapshot ? &current_snapshot->memory : nullptr, memory_dirty.data());
+  if (vertexCache)
+    RestorePages(vertexCache, VERTEX_CACHE_SIZE, state->vertices,
+                 current_snapshot ? &current_snapshot->vertices : nullptr, vertices_dirty.data());
+  std::memcpy(CPU_reg, state->cpu.data(), sizeof(CPU_reg));
+  std::memcpy(CP0_reg, state->cp0.data(), sizeof(CP0_reg));
+  std::memcpy(GTE_data_reg, state->gte_data.data(), sizeof(GTE_data_reg));
+  std::memcpy(GTE_ctrl_reg, state->gte_control.data(), sizeof(GTE_ctrl_reg));
+  current_snapshot = state;
+}
+
+
 ALWAYS_INLINE_RELEASE void MakeValid(PGXP_value* pV, uint32_t psxV)
 {
   if (VALID_01 != (pV->flags & VALID_01))
@@ -160,14 +279,18 @@ ALWAYS_INLINE_RELEASE double f16Overflow(double in)
 
 ALWAYS_INLINE_RELEASE PGXP_value* GetPtr(uint32_t addr)
 {
+  size_t index;
   if ((addr & CPU::DCACHE_LOCATION_MASK) == CPU::DCACHE_LOCATION)
-    return &Mem[PGXP_MEM_SCRATCH_OFFSET + ((addr & CPU::DCACHE_OFFSET_MASK) >> 2)];
-
-  const uint32_t paddr = (addr & CPU::PHYSICAL_MEMORY_ADDRESS_MASK);
-  if (paddr < Bus::RAM_MIRROR_END)
-    return &Mem[(paddr & Bus::g_ram_mask) >> 2];
+    index = PGXP_MEM_SCRATCH_OFFSET + ((addr & CPU::DCACHE_OFFSET_MASK) >> 2);
   else
-    return nullptr;
+  {
+    const uint32_t paddr = addr & CPU::PHYSICAL_MEMORY_ADDRESS_MASK;
+    if (paddr >= Bus::RAM_MIRROR_END)
+      return nullptr;
+    index = (paddr & Bus::g_ram_mask) >> 2;
+  }
+  memory_dirty[index / SNAPSHOT_PAGE_VALUES] = true;
+  return &Mem[index];
 }
 
 ALWAYS_INLINE_RELEASE PGXP_value* ReadMem(uint32_t addr)
@@ -277,6 +400,7 @@ ALWAYS_INLINE_RELEASE static void WriteMem16(const PGXP_value* src, uint32_t add
 
 void Initialize()
 {
+  TrimMemorySnapshots();
   std::memset(CPU_reg, 0, sizeof(CPU_reg));
   std::memset(CP0_reg, 0, sizeof(CP0_reg));
 
@@ -306,6 +430,7 @@ void Initialize()
 
 void Reset()
 {
+  TrimMemorySnapshots();
   std::memset(CPU_reg, 0, sizeof(CPU_reg));
   std::memset(CP0_reg, 0, sizeof(CP0_reg));
 
@@ -321,6 +446,7 @@ void Reset()
 
 void Shutdown()
 {
+  TrimMemorySnapshots();
   if (vertexCache)
   {
     std::free(vertexCache);
@@ -493,7 +619,9 @@ ALWAYS_INLINE_RELEASE void PGXP_CacheVertex(int16_t sx, int16_t sy, const PGXP_v
   if (sx >= -0x800 && sx <= 0x7ff && sy >= -0x800 && sy <= 0x7ff)
   {
     // Write vertex into cache
-    vertexCache[(sy + 0x800) * VERTEX_CACHE_WIDTH + (sx + 0x800)] = vertex;
+    const size_t index = (sy + 0x800) * VERTEX_CACHE_WIDTH + (sx + 0x800);
+    vertices_dirty[index / SNAPSHOT_PAGE_VALUES] = true;
+    vertexCache[index] = vertex;
   }
 }
 
@@ -502,7 +630,9 @@ static ALWAYS_INLINE_RELEASE PGXP_value* PGXP_GetCachedVertex(short sx, short sy
   if (sx >= -0x800 && sx <= 0x7ff && sy >= -0x800 && sy <= 0x7ff)
   {
     // Return pointer to cache entry
-    return &vertexCache[(sy + 0x800) * VERTEX_CACHE_WIDTH + (sx + 0x800)];
+    const size_t index = (sy + 0x800) * VERTEX_CACHE_WIDTH + (sx + 0x800);
+    vertices_dirty[index / SNAPSHOT_PAGE_VALUES] = true;
+    return &vertexCache[index];
   }
 
   return nullptr;

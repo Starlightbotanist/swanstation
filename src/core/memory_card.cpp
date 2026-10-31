@@ -280,6 +280,8 @@ bool MemoryCard::LoadFromFile()
 
 bool MemoryCard::SaveIfChanged(bool display_osd_message)
 {
+  if (System::IsTemporaryState())
+    return true;
   m_save_event->Deactivate();
 
   if (!m_changed)

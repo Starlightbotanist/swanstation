@@ -20,8 +20,15 @@
 
 #pragma once
 #include "types.h"
+#include <memory>
 
 namespace PGXP {
+
+struct MemorySnapshot;
+bool SaveMemorySnapshot(std::shared_ptr<const MemorySnapshot>* output);
+bool MemorySnapshotMatches(const std::shared_ptr<const MemorySnapshot>& state);
+void LoadMemorySnapshot(const std::shared_ptr<const MemorySnapshot>& state);
+void TrimMemorySnapshots();
 
 void Initialize();
 void Reset();
